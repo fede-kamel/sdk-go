@@ -55,14 +55,21 @@ func WithCloseTimeout(d time.Duration) TunnelOption {
 	}
 }
 
+// TokenSource supplies the edge token for one WebSocket dial. The tunnel
+// proxy calls it for every tunneled connection, so a source that reads the
+// token from disk presents a token rewritten by `openshell gateway login`
+// on the next connection without a restart. It must be safe for concurrent
+// use.
+type TokenSource func() (string, error)
+
 // TunnelProxy bridges gRPC connections over a WebSocket tunnel.
 // The gRPC client dials TunnelProxy.Addr() instead of the remote gateway.
-// Each accepted connection spawns a goroutine that dials the gateway over
-// WebSocket and copies data bidirectionally.
+// Each accepted connection spawns a goroutine that obtains the edge token,
+// dials the gateway over WebSocket and copies data bidirectionally.
 type TunnelProxy struct {
 	listener     net.Listener
 	gatewayURL   string
-	edgeToken    string
+	tokenSource  TokenSource
 	logger       types.Logger
 	closeTimeout time.Duration
 	httpClient   *http.Client
@@ -79,15 +86,34 @@ type TunnelProxy struct {
 // NewTunnelProxy creates a tunnel proxy that forwards TCP connections
 // through a WebSocket connection to gatewayURL. The edgeToken authenticates
 // with the edge proxy via Cloudflare Access headers on the WebSocket
-// handshake.
+// handshake and is fixed for the lifetime of the proxy; use
+// [NewTunnelProxyWithTokenSource] when the token can change while the
+// proxy runs.
 //
 // Returns error if gatewayURL is empty or invalid, or if edgeToken is empty.
 func NewTunnelProxy(gatewayURL, edgeToken string, opts ...TunnelOption) (*TunnelProxy, error) {
+	if edgeToken == "" {
+		return nil, errors.New("edge token must not be empty")
+	}
+	return NewTunnelProxyWithTokenSource(gatewayURL, func() (string, error) { return edgeToken, nil }, opts...)
+}
+
+// NewTunnelProxyWithTokenSource is like [NewTunnelProxy] but obtains the
+// edge token from src for every WebSocket dial instead of sending a fixed
+// string. A source that reads the token from disk, such as
+// [github.com/ai-openshell/sdk-go/openshell/v1/gateway.EdgeTokenSource],
+// lets a long-running tunnel pick up a token rewritten by
+// `openshell gateway login` without a restart. When src fails or returns
+// an empty token, the tunneled connection is closed and the error is
+// logged; the next connection calls src again.
+//
+// Returns error if gatewayURL is empty or invalid, or if src is nil.
+func NewTunnelProxyWithTokenSource(gatewayURL string, src TokenSource, opts ...TunnelOption) (*TunnelProxy, error) {
 	if gatewayURL == "" {
 		return nil, errors.New("gateway URL must not be empty")
 	}
-	if edgeToken == "" {
-		return nil, errors.New("edge token must not be empty")
+	if src == nil {
+		return nil, errors.New("token source must not be nil")
 	}
 
 	// Validate the URL parses correctly.
@@ -129,7 +155,7 @@ func NewTunnelProxy(gatewayURL, edgeToken string, opts ...TunnelOption) (*Tunnel
 	tp := &TunnelProxy{
 		listener:     listener,
 		gatewayURL:   gatewayURL,
-		edgeToken:    edgeToken,
+		tokenSource:  src,
 		logger:       cfg.logger,
 		closeTimeout: cfg.closeTimeout,
 		httpClient:   httpClient,
@@ -229,8 +255,22 @@ func (tp *TunnelProxy) acceptLoop() {
 	}
 }
 
-// bridge dials the gateway over WebSocket and copies data bidirectionally
-// between the local TCP connection and the WebSocket connection.
+// edgeToken obtains the edge token for one WebSocket dial from the
+// configured source.
+func (tp *TunnelProxy) edgeToken() (string, error) {
+	token, err := tp.tokenSource()
+	if err != nil {
+		return "", err
+	}
+	if token == "" {
+		return "", errors.New("token source returned an empty edge token")
+	}
+	return token, nil
+}
+
+// bridge obtains the edge token, dials the gateway over WebSocket and
+// copies data bidirectionally between the local TCP connection and the
+// WebSocket connection.
 func (tp *TunnelProxy) bridge(local net.Conn) {
 	defer tp.wg.Done()
 	defer func() { _ = local.Close() }()
@@ -238,11 +278,21 @@ func (tp *TunnelProxy) bridge(local net.Conn) {
 	ctx, cancel := context.WithCancel(tp.ctx)
 	defer cancel()
 
+	// Read the token per dial so a token rewritten on disk is used by new
+	// connections without restarting the proxy.
+	token, err := tp.edgeToken()
+	if err != nil {
+		if tp.logger != nil {
+			tp.logger.Error(err, "tunnel edge token load failed")
+		}
+		return
+	}
+
 	// Build WebSocket dial options with edge auth headers.
 	dialOpts := &websocket.DialOptions{
 		HTTPHeader: http.Header{
-			"cf-access-jwt-assertion": []string{tp.edgeToken},
-			"cookie":                  []string{fmt.Sprintf("CF_Authorization=%s", tp.edgeToken)},
+			"cf-access-jwt-assertion": []string{token},
+			"cookie":                  []string{fmt.Sprintf("CF_Authorization=%s", token)},
 		},
 	}
 	if tp.httpClient != nil {

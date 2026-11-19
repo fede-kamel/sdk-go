@@ -6,6 +6,7 @@ package edge
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -497,4 +499,168 @@ func TestTunnelProxy_DataRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, msg, buf)
+}
+
+// handshakeRecorder echoes like echoWSHandler and records the headers of
+// every WebSocket handshake it accepts.
+type handshakeRecorder struct {
+	mu      sync.Mutex
+	headers []http.Header
+}
+
+func (rec *handshakeRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	rec.mu.Lock()
+	rec.headers = append(rec.headers, r.Header.Clone())
+	rec.mu.Unlock()
+	echoWSHandler(w, r)
+}
+
+// Headers returns a copy of the recorded handshake headers in order.
+func (rec *handshakeRecorder) Headers() []http.Header {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return slices.Clone(rec.headers)
+}
+
+// startRecordingEchoServer starts an echo server that records handshake
+// headers. Returns the recorder and the server's ws:// URL.
+func startRecordingEchoServer(t *testing.T) (*handshakeRecorder, string) {
+	t.Helper()
+	rec := &handshakeRecorder{}
+	srv := httptest.NewServer(rec)
+	t.Cleanup(srv.Close)
+	return rec, "ws" + srv.URL[len("http"):]
+}
+
+// roundTrip opens one connection through the tunnel, sends msg and returns
+// the echoed bytes. The error is the first write or read failure.
+func roundTrip(t *testing.T, tp *TunnelProxy, msg string) (string, error) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", tp.Addr(), 2*time.Second)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		return "", err
+	}
+	buf := make([]byte, len(msg))
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err := io.ReadFull(conn, buf)
+	return string(buf[:n]), err
+}
+
+// --- Test: edge token headers on the WebSocket handshake ---
+
+func TestNewTunnelProxy_SendsEdgeTokenOnDial(t *testing.T) {
+	rec, wsURL := startRecordingEchoServer(t)
+
+	tp, err := NewTunnelProxy(wsURL, "fixed-token")
+	require.NoError(t, err)
+	defer func() { _ = tp.Close() }()
+
+	got, err := roundTrip(t, tp, "ping")
+	require.NoError(t, err)
+	assert.Equal(t, "ping", got)
+
+	headers := rec.Headers()
+	require.Len(t, headers, 1)
+	assert.Equal(t, "fixed-token", headers[0].Get("cf-access-jwt-assertion"))
+	assert.Equal(t, "CF_Authorization=fixed-token", headers[0].Get("cookie"))
+}
+
+// --- Test: token source ---
+
+func TestNewTunnelProxyWithTokenSource_NilSource(t *testing.T) {
+	_, wsURL := startEchoServer(t)
+
+	_, err := NewTunnelProxyWithTokenSource(wsURL, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "token source")
+}
+
+func TestNewTunnelProxyWithTokenSource_RereadsTokenPerDial(t *testing.T) {
+	rec, wsURL := startRecordingEchoServer(t)
+
+	oldToken, newToken := "old-token", "new-token"
+	var current atomic.Pointer[string]
+	current.Store(&oldToken)
+	var calls atomic.Int32
+
+	tp, err := NewTunnelProxyWithTokenSource(wsURL, func() (string, error) {
+		calls.Add(1)
+		return *current.Load(), nil
+	})
+	require.NoError(t, err)
+	defer func() { _ = tp.Close() }()
+
+	got, err := roundTrip(t, tp, "first")
+	require.NoError(t, err)
+	assert.Equal(t, "first", got)
+
+	// The CLI rewrites the token while the proxy keeps running.
+	current.Store(&newToken)
+
+	got, err = roundTrip(t, tp, "second")
+	require.NoError(t, err)
+	assert.Equal(t, "second", got)
+
+	headers := rec.Headers()
+	require.Len(t, headers, 2)
+	assert.Equal(t, "old-token", headers[0].Get("cf-access-jwt-assertion"))
+	assert.Equal(t, "CF_Authorization=old-token", headers[0].Get("cookie"))
+	assert.Equal(t, "new-token", headers[1].Get("cf-access-jwt-assertion"),
+		"second dial must not reuse the stale token")
+	assert.Equal(t, "CF_Authorization=new-token", headers[1].Get("cookie"))
+	assert.EqualValues(t, 2, calls.Load(), "token source should be called once per dial")
+}
+
+func TestNewTunnelProxyWithTokenSource_RetriesSourceAfterFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		fail func() (string, error)
+	}{
+		{"error", func() (string, error) { return "", errors.New("edge_token missing") }},
+		{"empty", func() (string, error) { return "", nil }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, wsURL := startRecordingEchoServer(t)
+
+			var mu sync.Mutex
+			var current string
+			src := func() (string, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				if current == "" {
+					return tc.fail()
+				}
+				return current, nil
+			}
+
+			logger := &testLogger{}
+			tp, err := NewTunnelProxyWithTokenSource(wsURL, src, WithTunnelLogger(logger))
+			require.NoError(t, err)
+			defer func() { _ = tp.Close() }()
+
+			// Without a token the tunnel must close the local connection
+			// without dialing the gateway.
+			_, err = roundTrip(t, tp, "blocked")
+			require.Error(t, err)
+			assert.Empty(t, rec.Headers(), "no WebSocket handshake without a token")
+			assert.Contains(t, logger.Messages(), "ERROR: tunnel edge token load failed")
+
+			// The token appears later, as after `openshell gateway login`.
+			mu.Lock()
+			current = "late-token"
+			mu.Unlock()
+
+			got, err := roundTrip(t, tp, "allowed")
+			require.NoError(t, err)
+			assert.Equal(t, "allowed", got)
+
+			headers := rec.Headers()
+			require.Len(t, headers, 1)
+			assert.Equal(t, "late-token", headers[0].Get("cf-access-jwt-assertion"))
+		})
+	}
 }

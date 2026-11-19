@@ -70,6 +70,22 @@
 //	}
 //	defer client.Close()
 //
+// NewTunnelProxy sends the same edge token on every WebSocket dial. When
+// the CLI manages the token, build the tunnel with
+// NewTunnelProxyWithTokenSource and gateway.EdgeTokenSource instead: each
+// dial then reads the current token, so a token rewritten by
+// `openshell gateway login` takes effect for new connections without a
+// restart:
+//
+//	cfg, err := gateway.LoadConfig("prod")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	tunnel, err := edge.NewTunnelProxyWithTokenSource(
+//	    "wss://gateway.example.com/ws",
+//	    gateway.EdgeTokenSource(cfg.Dir),
+//	)
+//
 // Use functional options to configure TLS, logging, and close timeout:
 //
 //	tunnel, err := edge.NewTunnelProxy(

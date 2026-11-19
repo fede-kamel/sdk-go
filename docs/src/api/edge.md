@@ -63,12 +63,31 @@ client, err := v1.NewClient(v1.Config{
 })
 ```
 
+`NewTunnelProxy` sends the same edge token on every WebSocket dial. When the
+CLI manages the token, build the tunnel with `NewTunnelProxyWithTokenSource`
+and `gateway.EdgeTokenSource` instead. Each dial then reads the current token,
+so a token rewritten by `openshell gateway login` takes effect for new
+connections without a restart. If the source fails, the tunneled connection is
+closed and the error is logged; the next connection calls the source again.
+
+```go
+cfg, err := gateway.LoadConfig("prod")
+if err != nil {
+    log.Fatal(err)
+}
+tunnel, err := edge.NewTunnelProxyWithTokenSource(
+    "wss://gateway.example.com/ws",
+    gateway.EdgeTokenSource(cfg.Dir),
+)
+```
+
 ## Functions
 
 | Function | Description |
 |----------|-------------|
 | `CloudflareAccess(base, edgeToken)` | Wrap an AuthProvider with Cloudflare Access headers |
 | `NewTunnelProxy(url, edgeToken, opts...)` | Create a WebSocket tunnel proxy for gRPC-over-HTTP/1.1 |
+| `NewTunnelProxyWithTokenSource(url, src, opts...)` | Like `NewTunnelProxy`, but calls `src` for the edge token on every dial |
 
 ## TunnelProxy Methods
 
@@ -84,6 +103,11 @@ client, err := v1.NewClient(v1.Config{
 | `WithTunnelTLS(cfg)` | Configure TLS for the WebSocket connection |
 | `WithTunnelLogger(l)` | Set a logger for tunnel events |
 | `WithCloseTimeout(d)` | Override the graceful shutdown timeout (default 5s) |
+
+## TokenSource
+
+`TokenSource` is `func() (string, error)`. The tunnel proxy calls it for every
+WebSocket dial, so it must be safe for concurrent use.
 
 ## Thread Safety
 

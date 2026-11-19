@@ -149,6 +149,28 @@ func TestLazyEdgeAuth_TokenRemovedAfterSuccess(t *testing.T) {
 	}
 }
 
+func TestEdgeTokenSource_ReloadsRewrittenToken(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, edgeTokenFile, "old-token")
+
+	src := EdgeTokenSource(dir)
+
+	token, err := src()
+	require.NoError(t, err)
+	assert.Equal(t, "old-token", token)
+
+	writeFile(t, dir, edgeTokenFile, "new-token")
+
+	token, err = src()
+	require.NoError(t, err)
+	assert.Equal(t, "new-token", token)
+
+	require.NoError(t, os.Remove(filepath.Join(dir, edgeTokenFile)))
+
+	_, err = src()
+	require.ErrorIs(t, err, ErrTokenLoad)
+}
+
 // --- T015: diskTokenSource tests ---
 
 const loginHint = "run `openshell gateway login prod`"

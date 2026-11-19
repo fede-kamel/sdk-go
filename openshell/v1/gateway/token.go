@@ -59,6 +59,21 @@ func readEdgeToken(dir string) (string, error) {
 	return token, nil
 }
 
+// EdgeTokenSource returns a function that reads the edge token from the
+// gateway directory dir on every call, trying edge_token first and falling
+// back to the legacy cf_token, as the cloudflare_jwt auth provider does for
+// each RPC. Pass it to
+// [github.com/ai-openshell/sdk-go/openshell/v1/edge.NewTunnelProxyWithTokenSource]
+// so a tunnel proxy presents a token rewritten by `openshell gateway login`
+// on its next connection without a restart. Errors wrap [ErrTokenLoad].
+//
+// The returned function is safe for concurrent use.
+func EdgeTokenSource(dir string) func() (string, error) {
+	return func() (string, error) {
+		return readEdgeToken(dir)
+	}
+}
+
 // diskTokenSource implements oauth2.TokenSource by reading oidc_token.json
 // from disk on every Token() call. This allows the source to pick up
 // tokens refreshed by the Rust CLI without process restart.

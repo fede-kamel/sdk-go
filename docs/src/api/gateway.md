@@ -27,6 +27,7 @@ defer client.Close()
 | `NewClient(name, opts...)` | Create a fully wired SDK client from gateway config |
 | `LoadConfig(name)` | Parse gateway config without connecting |
 | `ListGateways()` | Enumerate all available gateways |
+| `EdgeTokenSource(dir)` | Per-call edge token reader for `edge.NewTunnelProxyWithTokenSource` |
 
 ### NewClient
 
@@ -127,7 +128,7 @@ type Info struct {
 | `"oidc"` | `AuthModeOIDC` | `v1.RefreshableToken` that reads `oidc_token.json` near expiry and fails once the token has expired |
 | `"mtls"` | `AuthModeMTLS` | Unsupported (use `WithAuth`) |
 
-With `AuthModeCloudflareJWT`, the SDK rereads the edge token file on each request, so a token refreshed by `openshell gateway login` takes effect without a restart. Keep the token file readable.
+With `AuthModeCloudflareJWT`, the SDK rereads the edge token file on each request, so a token refreshed by `openshell gateway login` takes effect without a restart. Keep the token file readable. `EdgeTokenSource` exposes the same per-call read for tunnel proxies built with `edge.NewTunnelProxyWithTokenSource`.
 
 The SDK tries `edge_token` first and falls back to the legacy `cf_token` only when `edge_token` is absent. Logout takes effect for a running client once neither token file remains. Removing only `edge_token` still permits authentication if a legacy `cf_token` remains.
 
